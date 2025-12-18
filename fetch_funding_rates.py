@@ -27,13 +27,15 @@ import time
 from typing import List, Dict, Any
 
 import requests
+from collections import defaultdict
 
 
 BINANCE_FUNDING_ENDPOINT = "https://fapi.binance.com/fapi/v1/fundingRate"
 
 
 def read_symbols_from_folder(folder: str) -> List[str]:
-    files = ["bn_200_usdt.txt", "bn_200_usdc.txt"]
+    # 保留向后兼容：若未指定文件集合，返回所有三个文件的并集
+    files = ["binance_bybit_200_usdt.txt", "binance_200_usdc.txt", "bybit_200_usdc.txt"]
     syms = []
     for fn in files:
         path = os.path.join(folder, fn)
@@ -49,6 +51,32 @@ def read_symbols_from_folder(folder: str) -> List[str]:
                 syms.append(s)
     # 去重并返回
     return sorted(list(dict.fromkeys(syms)))
+
+
+def read_symbols_from_files(folder: str, filenames: List[str]) -> List[str]:
+    syms = []
+    for fn in filenames:
+        path = os.path.join(folder, fn)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                s = s.strip('`\n\r ')
+                syms.append(s)
+    return sorted(list(dict.fromkeys(syms)))
+
+
+def read_symbols_for_binance(folder: str) -> List[str]:
+    files = ["binance_bybit_200_usdt.txt", "binance_200_usdc.txt"]
+    return read_symbols_from_files(folder, files)
+
+
+def read_symbols_for_bybit(folder: str) -> List[str]:
+    files = ["binance_bybit_200_usdt.txt", "bybit_200_usdc.txt"]
+    return read_symbols_from_files(folder, files)
 
 
 def ms_now() -> int:
@@ -208,6 +236,11 @@ def save_rows_to_csv(rows: List[Dict[str, Any]], path: str):
     print(f"已保存 {len(rows)} 行到 {path}")
 
 
+def sanitize_filename(name: str) -> str:
+    # 保留字母数字、-、_，其它字符替换为下划线，避免文件名问题
+    return ''.join(c if (c.isalnum() or c in ('-', '_')) else '_' for c in name)
+
+
 def main():
     p = argparse.ArgumentParser(description="Fetch funding rates from Binance and Bybit for symbols listed in ./symbols/")
     p.add_argument("--symbols-dir", default="./symbols", help="symbols 目录，包含 bn_200_usdt.txt 与 bn_200_usdc.txt")
@@ -216,12 +249,15 @@ def main():
     p.add_argument("--only-binance", action="store_true", help="只获取 Binance 的资金费率")
     args = p.parse_args()
 
-    syms = read_symbols_from_folder(args.symbols_dir)
-    if not syms:
+    syms_binance = read_symbols_for_binance(args.symbols_dir)
+    syms_bybit = read_symbols_for_bybit(args.symbols_dir)
+
+    if not syms_binance and not syms_bybit:
         print("未找到 symbols 文件或文件为空，请检查 ./symbols 下的 txt 文件")
         return
 
-    print(f"读取到 {len(syms)} 个交易对（去重后）示例前10：{syms[:10]}")
+    print(f"读取到 Binance {len(syms_binance)} 个交易对，示例前10：{syms_binance[:10]}")
+    print(f"读取到 Bybit {len(syms_bybit)} 个交易对，示例前10：{syms_bybit[:10]}")
 
     end_ms = ms_now()
     # start_ms = end_ms - args.days * 24 * 3600 * 1000
@@ -231,15 +267,17 @@ def main():
     binance_rows = []
     bybit_rows = []
 
-    for symbol in syms:
-        # Binance: 只有币对以 USDT/USDC 等符合 Binance futures 的 symbol 才有效，若请求返回空则跳过
+    # 先为 Binance 拉取（从 binance_bybit_200_usdt.txt 与 binance_200_usdc.txt）
+    for symbol in syms_binance:
         print(f"拉取 Binance 资金费率: {symbol} ...")
         b = fetch_binance_funding(symbol, start_ms, end_ms)
         if b:
             binance_rows.extend(b)
 
-        if not args.only_binance:
-            print(f"尝试拉取 Bybit 资金费率: {symbol} ...")
+    # 再为 Bybit 拉取（从 binance_bybit_200_usdt.txt 与 bybit_200_usdc.txt）
+    if not args.only_binance:
+        for symbol in syms_bybit:
+            print(f"拉取 Bybit 资金费率: {symbol} ...")
             bb = fetch_bybit_funding_v5(symbol, start_ms, end_ms)
             if bb:
                 bybit_rows.extend(bb[::-1])  # Bybit v5 返回按时间降序，反转为升序
@@ -247,9 +285,23 @@ def main():
                 print(f"未找到 Bybit 历史资金数据或解析失败: {symbol}")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    save_rows_to_csv(binance_rows, os.path.join(args.output_dir, "binance_funding.csv"))
+
+    # 按 exchange + symbol 分组，分别保存为单独文件，命名格式: <exchange>_funding_<symbol>.csv
+    all_rows = list(binance_rows)
     if not args.only_binance:
-        save_rows_to_csv(bybit_rows, os.path.join(args.output_dir, "bybit_funding.csv"))
+        all_rows.extend(bybit_rows)
+
+    grouped = defaultdict(list)
+    for r in all_rows:
+        exch = r.get("exchange")
+        sym = r.get("symbol")
+        if exch is None or sym is None:
+            continue
+        grouped[(exch, sym)].append(r)
+
+    for (exch, sym), rows in grouped.items():
+        fname = f"{exch}_funding_{sanitize_filename(sym)}.csv"
+        save_rows_to_csv(rows, os.path.join(args.output_dir, fname))
 
 
 if __name__ == "__main__":
